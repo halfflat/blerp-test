@@ -88,9 +88,17 @@ int main(int argc, char** argv) {
         TIFFGetField(tiff_src, TIFFTAG_PHOTOMETRIC, &src_photometric);
         TIFFGetFieldDefaulted(tiff_src, TIFFTAG_ORIENTATION, &src_orientation, uint16_t(1));
 
-        std::vector<float> src_data(src_h*src_w);
-        float pxl_scale = float(1ull<<(src_bpp-1));
+        void* src_dev_ptr_raw = nullptr;
+        std::size_t src_byte_pitch = 0;
+        gpu_assert(gpuMallocPitch(&src_dev_ptr_raw, &src_byte_pitch, src_w*sizeof(float), src_h));
 
+        if (src_byte_pitch%sizeof(float)) fatal("unmet assumption about pitch alignment");
+        std::size_t src_stride = src_byte_pitch/sizeof(float);
+        if (src_stride < src_w) fatal("misunderstood cuda/hip pitch api");
+
+        std::vector<float> src_data(src_h*src_stride);
+
+        float pxl_scale = float(1ull<<(src_bpp-1));
         auto scanline_size = TIFFScanlineSize(tiff_src);
         unsigned bytes_per_pixel = scanline_size/src_w;
         if ((bytes_per_pixel&(bytes_per_pixel-1))!=0 || bytes_per_pixel>4) fatal("can't work with this number of bytes per pixel in scanline");
@@ -101,16 +109,16 @@ int main(int argc, char** argv) {
             if (TIFFReadScanline(tiff_src, &scanline_raw[0], row, 0)<0) fatal("TIFFReadScaline failed");
 
             if (src_fmt==SAMPLEFORMAT_IEEEFP)
-                transform_scanline<float>(&scanline_raw[0], &src_data[row*src_w], src_w);
+                transform_scanline<float>(&scanline_raw[0], &src_data[row*src_stride], src_w);
             else switch (bytes_per_pixel) {
             case 1:
-                transform_scanline<uint8_t>(&scanline_raw[0], &src_data[row*src_w], src_w);
+                transform_scanline<uint8_t>(&scanline_raw[0], &src_data[row*src_stride], src_w);
                 break;
             case 2:
-                transform_scanline<uint16_t>(&scanline_raw[0], &src_data[row*src_w], src_w);
+                transform_scanline<uint16_t>(&scanline_raw[0], &src_data[row*src_stride], src_w);
                 break;
             case 4:
-                transform_scanline<uint32_t>(&scanline_raw[0], &src_data[row*src_w], src_w);
+                transform_scanline<uint32_t>(&scanline_raw[0], &src_data[row*src_stride], src_w);
                 break;
             default:
                 fatal("internal logic error");
@@ -121,12 +129,10 @@ int main(int argc, char** argv) {
         uint32_t out_h = uint32_t(std::round(over*src_h));
         std::vector<float> out_data(out_h*out_w);
 
-        void* src_dev_ptr_raw = nullptr;
         void* out_dev_ptr_raw = nullptr;
         void* pxd_dev_ptr_raw = nullptr;
 
         gpu_assert(gpuInit(0));
-        gpu_assert(gpuMalloc(&src_dev_ptr_raw, src_data.size()*sizeof(float)));
         gpu_assert(gpuMalloc(&out_dev_ptr_raw, out_data.size()*sizeof(float)));
         gpu_assert(gpuMalloc(&pxd_dev_ptr_raw, src_w*src_h*sizeof(pixel_delta)));
         gpu_assert(gpuMemcpyHtoD(src_dev_ptr_raw, &src_data[0], src_data.size()*sizeof(float)));
@@ -140,6 +146,7 @@ int main(int argc, char** argv) {
         const float* src_dev_ptr = static_cast<const float*>(src_dev_ptr_raw);
         float* out_dev_ptr = static_cast<float*>(out_dev_ptr_raw);
         pixel_delta* pxd_dev_ptr = static_cast<pixel_delta*>(pxd_dev_ptr_raw);
+        gpuTextureObject_t texobj;
 
         const unsigned n_iter = 1000;
 
@@ -147,15 +154,18 @@ int main(int argc, char** argv) {
         switch (method) {
         case method_array:
             gpuEventRecord(ev_start);
-            for (unsigned i = 0; i<n_iter; ++i) run_subsample_image_array(src_dev_ptr, src_w, src_h, out_dev_ptr, out_w, out_h);
+            for (unsigned i = 0; i<n_iter; ++i) run_subsample_image_array(src_dev_ptr, src_stride, src_w, src_h, out_dev_ptr, out_w, out_w, out_h);
             break;
         case method_precomp:
-            run_make_pixel_delta_array(src_dev_ptr, src_w, src_h, pxd_dev_ptr);
+            run_make_pixel_delta_array(src_dev_ptr, src_stride, src_w, src_h, pxd_dev_ptr);
             gpuEventRecord(ev_start);
-            for (unsigned i = 0; i<n_iter; ++i) run_subsample_pixel_delta_array(pxd_dev_ptr, src_w, src_h, out_dev_ptr, out_w, out_h);
+            for (unsigned i = 0; i<n_iter; ++i) run_subsample_pixel_delta_array(pxd_dev_ptr, src_w, src_h, out_dev_ptr, out_w, out_w, out_h);
             break;
         case method_texture:
-            fatal("unimplemented");
+            gpu_assert(make_texture_object(src_dev_ptr, src_stride, src_w, src_h, &texobj));
+            gpuEventRecord(ev_start);
+            for (unsigned i = 0; i<n_iter; ++i) run_subsample_texture(texobj, src_w, src_h, out_dev_ptr, out_w, out_w, out_h);
+            break;
         }
 
         gpuEventRecord(ev_stop);
